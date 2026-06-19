@@ -2,185 +2,211 @@ name: MSBuild
 
 on:
   push:
+    branches: [ main, master ]  # 推送代码到主干自动启动编译
     tags:
-      - "v*"
+      - "v*"                   # 打 v 开头标签时编译+发布Release
   pull_request:
-    tags:
-      - "v*"
+    branches: [ main, master ]  # 提交/更新PR时自动编译校验
+  workflow_dispatch:           # 支持在Actions页面手动触发编译
 
 env:
-  # Path to the solution file relative to the root of the project.
   SOLUTION_FILE_PATH: .
-
-  # Configuration type to build.
-  # You can convert this to a build matrix if you need coverage of multiple configuration types.
-  # https://docs.github.com/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
   BUILD_CONFIGURATION: Release
 
 jobs:
   build:
-    runs-on: windows-2019
+    runs-on: windows-2022
     if: github.repository == 'hzqst/CGAssistant'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x86, x64]
+        include:
+          - platform: x86
+            qt_arch: win32_msvc2019
+            address_model: 32
+            platform_toolset: v142
+            vs_arch: x86
+          - platform: x64
+            qt_arch: win64_msvc2019_64
+            address_model: 64
+            platform_toolset: v142
+            vs_arch: amd64
 
     steps:
-    - uses: hzqst/checkout@v2.3.4
-      
-    - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+    - uses: actions/checkout@v4
       with:
-        vs-version: '[15.9,16.12)'
+        submodules: recursive
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '[16,18)'
+
+    - name: Cache Qt
+      id: cache-qt
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/Qt
+        key: ${{ runner.os }}-Qt-5.15.0-${{ matrix.qt_arch }}
 
     - name: Install Qt
-      uses: jurplel/install-qt-action@v2.13.0
+      uses: jurplel/install-qt-action@v3
       with:
         version: 5.15.0
         host: windows
         target: desktop
-        arch: win32_msvc2019
-        install-deps: # optional, default is true
-        modules: # optional
-        cached: false # ${{ steps.cache-qt.outputs.cache-hit }}
-        tools : 'tools_qtcreator,9.,qt.tools.qtcreator'
-        
-    - name: Initialize dependencies
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: git submodule update --init --recursive
+        arch: ${{ matrix.qt_arch }}
+        cached: ${{ steps.cache-qt.outputs.cache-hit }}
+        tools: 'tools_qtcreator,qt.tools.qtcreator'
 
-    - name: Initialize qhttp
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+    - name: Create build directory
+      run: mkdir build
+      shell: cmd
+
+    - name: Initialize qhttp (http-parser)
+      working-directory: ${{ github.workspace }}
       run: |
         cd qhttp
-        mkdir 3rdparty
+        if not exist 3rdparty mkdir 3rdparty
         cd 3rdparty
-        git clone https://github.com/nodejs/http-parser.git
+        if not exist http-parser git clone --branch v2.9.4 https://github.com/nodejs/http-parser.git
       shell: cmd
 
-    - name: Initialize boost
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        cd boost
-        bootstrap.bat
-      shell: cmd
+    - name: Cache Boost build artifacts
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/boost/stage
+        key: ${{ runner.os }}-boost-${{ matrix.platform }}-v142-release
 
     - name: Build boost
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-          set InstallDir=%%i
-        )
-        if exist "%InstallDir%\Common7\Tools\vsdevcmd.bat" (  
-          "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=x86 -winsdk=10.0.17763.0
-          cd boost
-          b2 --toolset=msvc-14.2 --with-date_time --with-thread --with-container --with-system --with-locale --with-serialization --with-regex --stagedir="stage" link=static variant=release address-model=32 stage
-          b2 --toolset=msvc-14.2 --with-date_time --with-thread --with-container --with-system --with-locale --with-serialization --with-regex --stagedir="stage" runtime-link=static link=static variant=release address-model=32 stage
-        )
-      shell: cmd
-
-    - name: Build CGAHook
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: MSBuild.exe CGAssistant.sln /t:CGAHook /p:Configuration=Release /p:Platform="x86" /p:PlatformToolset=v142
-
-    - name: Build qhttp
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-          set InstallDir=%%i
-        )
-        if exist "%InstallDir%\Common7\Tools\vsdevcmd.bat" (  
-          "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=x86 -winsdk=10.0.17763.0
-          cd qhttp
-          qmake qhttp.pro -spec win32-msvc "CONFIG+=32bit" "CONFIG+=qtquickcompiler release" "INCLUDEPATH+=%GITHUB_WORKSPACE%\winsdk\Include\10.0.17763.0\ucrt" "LIBS += -L%GITHUB_WORKSPACE%\winsdk\Lib\10.0.17763.0\um\x86" "LIBS += -L%GITHUB_WORKSPACE%\winsdk\Lib\10.0.17763.0\ucrt\x86"
-          "${{env.Qt5_Dir}}/../../Tools/QtCreator/bin/jom/jom.exe" -f MakeFile qmake_all
-          "${{env.Qt5_Dir}}/../../Tools/QtCreator/bin/jom/jom.exe"
-          copy "%GITHUB_WORKSPACE%\qhttp\xbin\qhttp.dll" "%GITHUB_WORKSPACE%\build\"
-        )
-      shell: cmd
-
-    - name: Build CGAssistant
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+      working-directory: ${{ github.workspace }}
       run: |
         for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
           set InstallDir=%%i
         )
         if exist "%InstallDir%\Common7\Tools\vsdevcmd.bat" (
-          "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=x86 -winsdk=10.0.17763.0
+          call "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=${{ matrix.vs_arch }}
+          cd boost
+          if not exist b2.exe call bootstrap.bat
+          b2 --toolset=msvc-14.2 --with-date_time --with-thread --with-container --with-system --with-locale --with-serialization --with-regex --stagedir="stage_shared" link=static variant=release address-model=${{ matrix.address_model }} stage
+          b2 --toolset=msvc-14.2 --with-date_time --with-thread --with-container --with-system --with-locale --with-serialization --with-regex --stagedir="stage" runtime-link=static link=static variant=release address-model=${{ matrix.address_model }} stage
+        )
+      shell: cmd
+
+    - name: Build CGAHook
+      working-directory: ${{ github.workspace }}
+      run: MSBuild.exe CGAssistant.sln /t:CGAHook /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform="${{ matrix.platform }}" /p:PlatformToolset=${{ matrix.platform_toolset }}
+
+    - name: Build qhttp
+      working-directory: ${{ github.workspace }}
+      run: |
+        for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+          set InstallDir=%%i
+        )
+        if exist "%InstallDir%\Common7\Tools\vsdevcmd.bat" (
+          call "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=${{ matrix.vs_arch }}
+          cd qhttp
+          qmake qhttp.pro -spec win32-msvc "CONFIG+=${{ matrix.address_model }}bit" "CONFIG+=qtquickcompiler release"
+          "%Qt5_Dir%/../../Tools/QtCreator/bin/jom/jom.exe" -f MakeFile qmake_all
+          "%Qt5_Dir%/../../Tools/QtCreator/bin/jom/jom.exe"
+          copy /Y "xbin\qhttp.dll" "%GITHUB_WORKSPACE%\build\"
+        )
+      shell: cmd
+
+    - name: Build CGAssistant
+      working-directory: ${{ github.workspace }}
+      run: |
+        for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+          set InstallDir=%%i
+        )
+        if exist "%InstallDir%\Common7\Tools\vsdevcmd.bat" (
+          call "%InstallDir%\Common7\Tools\vsdevcmd.bat" -arch=${{ matrix.vs_arch }}
           cd CGAssistant
-          qmake CGAssistant.pro -spec win32-msvc "CONFIG+=32bit" "CONFIG+=qtquickcompiler release" "INCLUDEPATH+=%GITHUB_WORKSPACE%\winsdk\Include\10.0.17763.0\ucrt" "LIBS += -L%GITHUB_WORKSPACE%\winsdk\Lib\10.0.17763.0\um\x86" "LIBS += -L%GITHUB_WORKSPACE%\winsdk\Lib\10.0.17763.0\ucrt\x86"
-          "${{env.Qt5_Dir}}/../../Tools/QtCreator/bin/jom/jom.exe" -f MakeFile qmake_all
-          "${{env.Qt5_Dir}}/../../Tools/QtCreator/bin/jom/jom.exe"
-          copy "%GITHUB_WORKSPACE%\CGassistant\release\CGassistant.exe" "%GITHUB_WORKSPACE%\build\"
+          qmake CGAssistant.pro -spec win32-msvc "CONFIG+=${{ matrix.address_model }}bit" "CONFIG+=qtquickcompiler release"
+          "%Qt5_Dir%/../../Tools/QtCreator/bin/jom/jom.exe" -f MakeFile qmake_all
+          "%Qt5_Dir%/../../Tools/QtCreator/bin/jom/jom.exe"
+          copy /Y "release\CGAssistant.exe" "%GITHUB_WORKSPACE%\build\"
         )
       shell: cmd
 
     - name: Setup node environment
-      uses: actions/setup-node@v2
+      uses: actions/setup-node@v4
       with:
         node-version: '20.11.1'
-        architecture: 'x86'
+        architecture: ${{ matrix.platform }}
+
+    - name: Cache node-gyp and dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/AppData/Roaming/npm
+          ~/AppData/Roaming/npm-cache
+        key: ${{ runner.os }}-node-${{ matrix.platform }}-20.11.1-gyp
 
     - name: Install node-gyp
-      working-directory: ${{env.GITHUB_WORKSPACE}}
       run: npm install -g node-gyp
 
     - name: Build node-gyp
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+      working-directory: ${{ github.workspace }}
       run: build-nodegyp.bat
       shell: cmd
 
     - name: Deploy qt and msvc redistribution
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+      working-directory: ${{ github.workspace }}
       run: windeploy.bat
       shell: cmd
- 
-    - name: Create Output directory
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: mkdir Output
-      shell: cmd
 
-    - name: Copy Build to Output
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: xcopy "build" "Output" /y /e
-      shell: cmd
-
-    - name: Copy node.exe
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+    - name: Prepare Output directory
+      working-directory: ${{ github.workspace }}
       run: |
-        echo "Current PATH: $env:PATH"
+        if not exist Output mkdir Output
+        xcopy "build" "Output" /y /e
         $nodePath = (Get-Command node).Source
-        echo "Node.js path: $nodePath"
         Copy-Item -Path $nodePath -Destination "Output/node.exe" -Force
       shell: pwsh
 
     - name: Checkout CGAssistantJS
-      uses: hzqst/checkout@main
+      uses: actions/checkout@v4
       with:
         repository: 'hzqst/CGAssistantJS'
         path: 'CGAssistantJS'
 
+    - name: Cache CGAssistantJS node_modules
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/CGAssistantJS/node_modules
+        key: ${{ runner.os }}-${{ matrix.platform }}-cgassistantjs-${{ hashFiles('CGAssistantJS/package-lock.json') }}
+
     - name: npm install in CGAssistantJS
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        cd CGAssistantJS
-        npm install
+      working-directory: ${{ github.workspace }}/CGAssistantJS
+      run: npm install
       shell: cmd
 
     - name: Copy CGAssistantJS to Output
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+      working-directory: ${{ github.workspace }}
       run: |
         chcp 936
         xcopy "CGAssistantJS" "Output" /y /e
       shell: cmd
 
-    - name: Zipping All
-      uses: hzqst/action-zip@master
+    - name: Package build artifacts
+      uses: thedoctor0/zip-release@master
       with:
-        files: Output/
-        dest: CGAssistant-windows-x86-win10.zip
+        type: 'zip'
+        filename: CGAssistant-windows-${{ matrix.platform }}.zip
+        path: Output
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
+    - name: Upload artifact (workflow download)
+      uses: actions/upload-artifact@v4
+      with:
+        name: CGAssistant-windows-${{ matrix.platform }}
+        path: CGAssistant-windows-${{ matrix.platform }}.zip
+
+    - name: Create Release and upload assets
+      uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        name: CGAssistant-${{ github.ref }}
-        files: |
-          CGAssistant-windows-x86-win10.zip
+        name: CGAssistant ${{ github.ref_name }}
+        files: CGAssistant-windows-${{ matrix.platform }}.zip
+        generate_release_notes: true
